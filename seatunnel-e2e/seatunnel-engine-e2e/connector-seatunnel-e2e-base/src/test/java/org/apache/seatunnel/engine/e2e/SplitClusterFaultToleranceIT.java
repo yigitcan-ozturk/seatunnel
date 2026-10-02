@@ -1224,8 +1224,16 @@ public class SplitClusterFaultToleranceIT {
                     workerNode1.node.getNodeEngine().getService(SeaTunnelServer.SERVICE_NAME);
             SeaTunnelServer workerServer2 =
                     workerNode2.node.getNodeEngine().getService(SeaTunnelServer.SERVICE_NAME);
+
+            // Evidence markers for #12494: keep node identity, task-group location and the exact
+            // in-memory execution-context identity together so CI logs can distinguish generations
+            // even though TaskExecutionState itself is keyed only by TaskGroupLocation.
+            logResetEvidence("before-reset", workerNode1, workerServer1, taskGroupLocations);
+            logResetEvidence("before-reset", workerNode2, workerServer2, taskGroupLocations);
             workerServer1.reset();
             workerServer2.reset();
+            logResetEvidence("after-reset", workerNode1, workerServer1, taskGroupLocations);
+            logResetEvidence("after-reset", workerNode2, workerServer2, taskGroupLocations);
 
             Awaitility.await()
                     .atMost(10000, TimeUnit.MILLISECONDS)
@@ -1716,6 +1724,38 @@ public class SplitClusterFaultToleranceIT {
             return masterNode2;
         }
         return null;
+    }
+
+    private static void logResetEvidence(
+            String phase,
+            HazelcastInstanceImpl workerNode,
+            SeaTunnelServer workerServer,
+            List<TaskGroupLocation> taskGroupLocations) {
+        String memberIdentity =
+                workerNode.getCluster().getLocalMember().getUuid()
+                        + "@"
+                        + workerNode.getCluster().getLocalMember().getAddress();
+        for (TaskGroupLocation location : taskGroupLocations) {
+            try {
+                TaskGroupContext context =
+                        workerServer
+                                .getTaskExecutionService()
+                                .getActiveExecutionContext(location);
+                log.warn(
+                        "ZETA-12494-EVIDENCE phase={} member={} location={} contextIdentity={} resetRequested={}",
+                        phase,
+                        memberIdentity,
+                        location,
+                        System.identityHashCode(context),
+                        context.isResetRequested());
+            } catch (TaskGroupContextNotFoundException e) {
+                log.warn(
+                        "ZETA-12494-EVIDENCE phase={} member={} location={} context=absent",
+                        phase,
+                        memberIdentity,
+                        location);
+            }
+        }
     }
 
     /** Waits until a standby master has taken over coordinator activity after a failover. */
