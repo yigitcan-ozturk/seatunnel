@@ -1738,9 +1738,7 @@ public class SplitClusterFaultToleranceIT {
         for (TaskGroupLocation location : taskGroupLocations) {
             try {
                 TaskGroupContext context =
-                        workerServer
-                                .getTaskExecutionService()
-                                .getActiveExecutionContext(location);
+                        workerServer.getTaskExecutionService().getActiveExecutionContext(location);
                 log.warn(
                         "ZETA-12494-EVIDENCE phase={} member={} location={} contextIdentity={} resetRequested={}",
                         phase,
