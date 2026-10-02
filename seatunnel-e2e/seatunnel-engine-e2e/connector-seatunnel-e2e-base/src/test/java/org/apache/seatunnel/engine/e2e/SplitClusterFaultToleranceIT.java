@@ -38,7 +38,10 @@ import org.apache.seatunnel.engine.server.SeaTunnelServerStarter;
 import org.apache.seatunnel.engine.server.dag.physical.PhysicalPlan;
 import org.apache.seatunnel.engine.server.dag.physical.PhysicalVertex;
 import org.apache.seatunnel.engine.server.dag.physical.SubPlan;
+import org.apache.seatunnel.engine.server.exception.TaskGroupContextNotFoundException;
 import org.apache.seatunnel.engine.server.execution.ExecutionState;
+import org.apache.seatunnel.engine.server.execution.TaskGroupContext;
+import org.apache.seatunnel.engine.server.execution.TaskGroupLocation;
 import org.apache.seatunnel.engine.server.master.JobMaster;
 
 import org.awaitility.Awaitility;
@@ -64,6 +67,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.apache.seatunnel.shade.com.google.common.base.Preconditions.checkArgument;
 
@@ -1196,14 +1200,81 @@ public class SplitClusterFaultToleranceIT {
             CompletableFuture<JobStatus> objectCompletableFuture =
                     CompletableFuture.supplyAsync(clientJobProxy::waitForJobComplete);
 
-            // shutdown master node
-            masterNode2.shutdown();
+            long jobId = clientJobProxy.getJobId();
+            HazelcastInstanceImpl activeMaster = waitAndFindActiveMaster(masterNode1, masterNode2);
+            HazelcastInstanceImpl standbyMaster =
+                    activeMaster == masterNode1 ? masterNode2 : masterNode1;
+            JobMaster jobMasterBeforeReset = getJobMaster(activeMaster, jobId);
+            Assertions.assertNotNull(jobMasterBeforeReset);
+            List<TaskGroupLocation> taskGroupLocations =
+                    jobMasterBeforeReset.getPhysicalPlan().getPipelineList().stream()
+                            .flatMap(subPlan -> subPlan.getPhysicalVertexList().stream())
+                            .map(PhysicalVertex::getTaskGroupLocation)
+                            .collect(Collectors.toList());
+            Assertions.assertFalse(taskGroupLocations.isEmpty());
+            int restoreCountBeforeReset =
+                    jobMasterBeforeReset.getPhysicalPlan().getPipelineList().stream()
+                            .mapToInt(SubPlan::getPipelineRestoreNum)
+                            .sum();
+
+            // Hazelcast invokes ManagedService.reset() on members that merge back into a cluster.
+            // Reset both workers to model the losing side's task contexts. Their old terminal
+            // notifications must not be applied to the active master's task generations.
+            SeaTunnelServer workerServer1 =
+                    workerNode1.node.getNodeEngine().getService(SeaTunnelServer.SERVICE_NAME);
+            SeaTunnelServer workerServer2 =
+                    workerNode2.node.getNodeEngine().getService(SeaTunnelServer.SERVICE_NAME);
+
+            // Evidence markers for #12494: keep node identity, task-group location and the exact
+            // in-memory execution-context identity together so CI logs can distinguish generations
+            // even though TaskExecutionState itself is keyed only by TaskGroupLocation.
+            logResetEvidence("before-reset", workerNode1, workerServer1, taskGroupLocations);
+            logResetEvidence("before-reset", workerNode2, workerServer2, taskGroupLocations);
+            workerServer1.reset();
+            workerServer2.reset();
+            logResetEvidence("after-reset", workerNode1, workerServer1, taskGroupLocations);
+            logResetEvidence("after-reset", workerNode2, workerServer2, taskGroupLocations);
+
+            Awaitility.await()
+                    .atMost(10000, TimeUnit.MILLISECONDS)
+                    .untilAsserted(
+                            () ->
+                                    taskGroupLocations.forEach(
+                                            location ->
+                                                    assertTaskGroupResetRequested(
+                                                            location,
+                                                            workerServer1,
+                                                            workerServer2)));
+
+            Awaitility.await()
+                    .atMost(10000, TimeUnit.MILLISECONDS)
+                    .during(3000, TimeUnit.MILLISECONDS)
+                    .untilAsserted(
+                            () -> {
+                                Assertions.assertEquals(
+                                        JobStatus.RUNNING, clientJobProxy.getJobStatus());
+                                JobMaster currentJobMaster = getJobMaster(activeMaster, jobId);
+                                Assertions.assertNotNull(currentJobMaster);
+                                Assertions.assertEquals(
+                                        restoreCountBeforeReset,
+                                        currentJobMaster.getPhysicalPlan().getPipelineList()
+                                                .stream()
+                                                .mapToInt(SubPlan::getPipelineRestoreNum)
+                                                .sum(),
+                                        "Reset notifications from old worker contexts must not "
+                                                + "trigger another restore");
+                            });
+
+            // This in-process fixture does not evict workers, so explicitly fail over the master
+            // to exercise recovery from the durable checkpoint after the local worker reset.
+            activeMaster.shutdown();
             Awaitility.await()
                     .atMost(10000, TimeUnit.MILLISECONDS)
                     .untilAsserted(
                             () ->
                                     Assertions.assertEquals(
-                                            3, finalNode.getCluster().getMembers().size()));
+                                            3, standbyMaster.getCluster().getMembers().size()));
+            awaitCoordinatorActive(standbyMaster, 30);
 
             Awaitility.await()
                     .atMost(300000, TimeUnit.MILLISECONDS)
@@ -1264,6 +1335,28 @@ public class SplitClusterFaultToleranceIT {
             if (workerNode2 != null) {
                 workerNode2.shutdown();
             }
+        }
+    }
+
+    private static void assertTaskGroupResetRequested(
+            TaskGroupLocation location,
+            SeaTunnelServer workerServer1,
+            SeaTunnelServer workerServer2) {
+        TaskGroupContext context = getTaskGroupContext(workerServer1, location);
+        if (context == null) {
+            context = getTaskGroupContext(workerServer2, location);
+        }
+        Assertions.assertNotNull(context, "No worker context found for " + location);
+        Assertions.assertTrue(
+                context.isResetRequested(), "Worker did not reset task group " + location);
+    }
+
+    private static TaskGroupContext getTaskGroupContext(
+            SeaTunnelServer workerServer, TaskGroupLocation location) {
+        try {
+            return workerServer.getTaskExecutionService().getExecutionContext(location);
+        } catch (TaskGroupContextNotFoundException ignored) {
+            return null;
         }
     }
 
@@ -1631,6 +1724,36 @@ public class SplitClusterFaultToleranceIT {
             return masterNode2;
         }
         return null;
+    }
+
+    private static void logResetEvidence(
+            String phase,
+            HazelcastInstanceImpl workerNode,
+            SeaTunnelServer workerServer,
+            List<TaskGroupLocation> taskGroupLocations) {
+        String memberIdentity =
+                workerNode.getCluster().getLocalMember().getUuid()
+                        + "@"
+                        + workerNode.getCluster().getLocalMember().getAddress();
+        for (TaskGroupLocation location : taskGroupLocations) {
+            try {
+                TaskGroupContext context =
+                        workerServer.getTaskExecutionService().getActiveExecutionContext(location);
+                log.warn(
+                        "ZETA-12494-EVIDENCE phase={} member={} location={} contextIdentity={} resetRequested={}",
+                        phase,
+                        memberIdentity,
+                        location,
+                        System.identityHashCode(context),
+                        context.isResetRequested());
+            } catch (TaskGroupContextNotFoundException e) {
+                log.warn(
+                        "ZETA-12494-EVIDENCE phase={} member={} location={} context=absent",
+                        phase,
+                        memberIdentity,
+                        location);
+            }
+        }
     }
 
     /** Waits until a standby master has taken over coordinator activity after a failover. */
